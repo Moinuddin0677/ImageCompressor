@@ -50,7 +50,7 @@ const uploadCSV = (req, res) => {
               const response = await axios({ url, responseType: "arraybuffer" });
               const image = await Jimp.read(Buffer.from(response.data));
               image.quality(50);
-              const outputPath = `compressed/${uuidv4()}.jpg`;
+              const outputPath = `${uuidv4()}/output.jpg`;
               await image.writeAsync(outputPath);
               outputImages.push(outputPath);
             } catch (error) {
