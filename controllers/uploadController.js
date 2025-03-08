@@ -1,4 +1,3 @@
-// controllers/uploadController.js
 const multer = require("multer");
 const csvParser = require("csv-parser");
 const fs = require("fs");
@@ -8,6 +7,7 @@ const path = require("path");
 const Jimp = require("jimp");
 const pool = require("../config/db");
 const dotenv = require("dotenv");
+const { Parser } = require("json2csv");
 
 dotenv.config();
 
@@ -16,10 +16,22 @@ const storage = multer.diskStorage({
   destination: "uploads/",
   filename: (req, file, cb) => cb(null, `${uuidv4()}-${file.originalname}`),
 });
-const upload = multer({ storage });
 
-// Upload handler
+const fileFilter = (req, file, cb) => {
+  if (file.mimetype === "text/csv" || file.originalname.endsWith(".csv")) {
+    cb(null, true);
+  } else {
+    cb(new Error("Invalid file type. Only CSV files are allowed."), false);
+  }
+};
+const upload = multer({ storage, fileFilter });
+
+
 const uploadCSV = (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No file uploaded" });
+  }
+
   const requestId = uuidv4();
   const results = [];
 
@@ -28,51 +40,64 @@ const uploadCSV = (req, res) => {
     .on("data", (data) => results.push(data))
     .on("end", async () => {
       try {
-        // Insert the overall request record
+
+
+        if (results.length === 0) {
+          return res.status(400).json({ error: "Empty CSV file uploaded" });
+        }
+
+        //Check if required columns exist
+        const requiredColumns = ["Serial Number", "Product Name", "Input Image Urls"];
+        const csvColumns = Object.keys(results[0]);
+
+        for (const column of requiredColumns) {
+          if (!csvColumns.includes(column)) {
+            return res.status(400).json({ error: `Invalid CSV format. Missing column: ${column}` });
+          }
+        }
+
+
         await pool.query(
           "INSERT INTO requests (request_id, status) VALUES ($1, $2)",
           [requestId, "Processing"]
         );
 
-        // Filter out empty rows
-        const filteredResults = results.filter((row) => Object.keys(row).length > 0);
-        // Process each CSV row
+        const filteredResults = results.filter(row => Object.keys(row).length > 0);
+
         for (const row of filteredResults) {
-          // Expect the Input Image Urls column to be a comma-separated string
           const inputUrls = row["Input Image Urls"].split(",").map(url => url.trim());
-          // Array to hold output image paths for this row
           const outputImages = [];
           let flag = true;
 
-          // Process each image URL
           for (const url of inputUrls) {
             try {
               const response = await axios({ url, responseType: "arraybuffer" });
               const image = await Jimp.read(Buffer.from(response.data));
               image.quality(50);
-              const outputPath = `${uuidv4()}/output.jpg`;
+              const fileName = `${uuidv4()}.jpg`;
+              const outputPath = path.join(__dirname, "../public/compressed", fileName);
+
               await image.writeAsync(outputPath);
-              outputImages.push(outputPath);
+              
+              // Store public URL instead of just file path
+              const imageUrl = `${process.env.BASE_URL}/compressed/${fileName}`;
+              outputImages.push(imageUrl);
             } catch (error) {
               flag = false;
               console.error(`Error processing image ${url}:`, error);
             }
           }
 
-          // If all images processed successfully, insert a row into images table
           if (flag) {
-            const outputImagesString = outputImages.join(",");
             await pool.query(
               "INSERT INTO images (request_id, input_url, output_url) VALUES ($1, $2, $3)",
-              [requestId, row["Input Image Urls"], outputImagesString]
+              [requestId, row["Input Image Urls"], outputImages.join(",")]
             );
           }
         }
 
-        // Update request status to Completed
         await pool.query("UPDATE requests SET status = 'Completed' WHERE request_id = $1", [requestId]);
 
-        // Trigger webhook if defined
         if (process.env.WEBHOOK_URL) {
           try {
             await axios.post(process.env.WEBHOOK_URL, { requestId, status: "Completed" });
@@ -89,7 +114,7 @@ const uploadCSV = (req, res) => {
     });
 };
 
-// Status handler
+
 const getStatus = async (req, res) => {
   try {
     const result = await pool.query(
@@ -106,8 +131,34 @@ const getStatus = async (req, res) => {
   }
 };
 
+const exportCSV = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT request_id, input_url, output_url FROM images WHERE request_id = $1",
+      [req.params.requestId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "No data available" });
+    }
+
+    // Convert JSON to CSV format
+    const fields = ["request_id", "input_url", "output_url"];
+    const json2csvParser = new Parser({ fields });
+    const csvData = json2csvParser.parse(rows);
+
+    res.header("Content-Type", "text/csv");
+    res.attachment("output_images.csv");
+    res.send(csvData);
+  } catch (error) {
+    console.error("Error exporting CSV:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
 module.exports = {
   uploadCSV,
   getStatus,
-  uploadMiddleware: upload.single("file")
+  uploadMiddleware: upload.single("file"), // ✅ Ensure Multer is correctly used
+  exportCSV,
 };
